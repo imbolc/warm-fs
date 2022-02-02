@@ -1,0 +1,16 @@
+[package]
+description = "File system warmer"
+edition = "2021"
+license = "MIT"
+name = "warm-fs"
+repository = "https://github.com/imbolc/warm-fs"
+version = "0.1.0"
+
+[dependencies]
+threadpool = "1"
+walkdir = "2"
+
+[dev-dependencies]
+clap = { version = "3", features = ["derive"] }
+indicatif = "0.16"
+rusty-hook = "0.11"
