@@ -5,32 +5,41 @@ use warm_fs::Warmer;
 #[clap(author, version, about, long_about = None)]
 struct Args {
     /// Folders to warm up
-    #[clap(default_value = "./")]
-    paths: Vec<String>,
+    #[clap(short, long)]
+    dirs: Vec<String>,
+
+    /// Files to warm up
+    #[clap(short, long)]
+    files: Vec<String>,
 
     /// Number threads
     #[clap(short, long, default_value_t = 100)]
     threads: usize,
 
     /// Do not follow links (sometime they can be circular)
-    #[clap(short, long)]
-    no_follow_links: bool,
+    #[clap(long)]
+    follow_links: bool,
 }
 
 fn main() {
     let args = Args::parse();
 
-    let warmer = Warmer::new(&args.paths, args.threads, !args.no_follow_links);
+    let mut warmer = Warmer::new(args.threads, args.follow_links);
+    warmer.add_dirs(&args.dirs);
+    warmer.add_files(&args.files);
+
     let bar = progress_bar(0);
 
     bar.set_prefix("Size estimation");
     for n in warmer.iter_estimate() {
         bar.inc_length(n);
     }
+
     bar.set_prefix("Files reading");
     for n in warmer.iter_warm() {
         bar.inc(n);
     }
+
     bar.abandon()
 }
 

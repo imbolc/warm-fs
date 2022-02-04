@@ -19,15 +19,17 @@
 #![warn(clippy::all, missing_docs, nonstandard_style, future_incompatible)]
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use threadpool::ThreadPool;
 use walkdir::WalkDir;
 
 /// The warmer
+#[derive(Default)]
 pub struct Warmer {
-    paths: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+    files: Vec<PathBuf>,
     num_threads: usize,
     follow_links: bool,
 }
@@ -39,13 +41,24 @@ pub struct Iter {
 
 impl Warmer {
     /// Creates a new warmer
-    pub fn new(paths: &[impl AsRef<Path>], num_threads: usize, follow_links: bool) -> Self {
-        let paths: Vec<_> = paths.iter().map(|p| p.as_ref().to_path_buf()).collect();
+    pub fn new(num_threads: usize, follow_links: bool) -> Self {
         Self {
-            paths,
             num_threads,
             follow_links,
+            ..Default::default()
         }
+    }
+
+    /// Adds folders to walk recursively
+    pub fn add_dirs(&mut self, paths: &[impl AsRef<Path>]) {
+        let mut paths: Vec<_> = paths.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        self.dirs.append(&mut paths);
+    }
+
+    /// Adds files directly to avoid folders traversal
+    pub fn add_files(&mut self, paths: &[impl AsRef<Path>]) {
+        let mut paths: Vec<_> = paths.iter().map(|p| p.as_ref().to_path_buf()).collect();
+        self.files.append(&mut paths);
     }
 
     /// Estimates total size to read, returns the total number of bytes
@@ -60,14 +73,25 @@ impl Warmer {
 
     /// Estimates total size to read, returns an iterator over file sizes
     pub fn iter_estimate(&self) -> Iter {
-        let (tx, rx) = mpsc::channel();
-        let paths = self.paths.clone();
+        let (tx, rx) = channel();
+        let dirs = self.dirs.clone();
+        let files = self.files.clone();
         let num_threads = self.num_threads;
         let follow_links = self.follow_links;
         std::thread::spawn(move || {
             let pool = ThreadPool::new(num_threads);
-            for path in paths {
-                for entry in walker(path, follow_links) {
+            for file in files {
+                let tx = tx.clone();
+                pool.execute(move || {
+                    if let Ok(Some(file)) = resolve_file(file) {
+                        if let Ok(size) = file.metadata().map(|m| m.len()) {
+                            tx.send(size).ok();
+                        }
+                    }
+                });
+            }
+            for dir in dirs {
+                for entry in walker(dir, follow_links) {
                     let tx = tx.clone();
                     pool.execute(move || {
                         if let Ok(size) = entry.metadata().map(|m| m.len()) {
@@ -82,31 +106,54 @@ impl Warmer {
 
     /// Reads files, returns an iterator over the read number of bytes
     pub fn iter_warm(&self) -> Iter {
-        let (tx, rx) = mpsc::channel();
-        let paths = self.paths.clone();
+        let (tx, rx) = channel();
+        let dirs = self.dirs.clone();
+        let files = self.files.clone();
         let num_threads = self.num_threads;
         let follow_links = self.follow_links;
         std::thread::spawn(move || {
             let pool = ThreadPool::new(num_threads);
-            for path in paths {
-                for entry in walker(path, follow_links) {
+            for file in files {
+                let tx = tx.clone();
+                pool.execute(move || {
+                    if let Ok(Some(file)) = resolve_file(file) {
+                        warm_file(file, tx);
+                    }
+                });
+            }
+            for dir in dirs {
+                for entry in walker(dir, follow_links) {
                     let tx = tx.clone();
-                    pool.execute(move || {
-                        if let Ok(mut file) = File::open(entry.path()) {
-                            let mut buffer = [0; 1024];
-                            loop {
-                                let count = file.read(&mut buffer).unwrap_or_default();
-                                if count == 0 {
-                                    break;
-                                }
-                                tx.send(count as u64).ok();
-                            }
-                        }
-                    });
+                    pool.execute(move || warm_file(entry.path(), tx));
                 }
             }
         });
         Iter { rx }
+    }
+}
+
+/// Checks if it's a file and resolves a possible simlink
+fn resolve_file(path: PathBuf) -> io::Result<Option<PathBuf>> {
+    if path.is_file() {
+        Ok(Some(path))
+    } else if path.is_symlink() {
+        path.canonicalize().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Warms a file
+fn warm_file(path: impl AsRef<Path>, tx: Sender<u64>) {
+    if let Ok(mut file) = File::open(path) {
+        let mut buffer = [0; 1024];
+        loop {
+            let count = file.read(&mut buffer).unwrap_or_default();
+            if count == 0 {
+                break;
+            }
+            tx.send(count as u64).ok();
+        }
     }
 }
 
